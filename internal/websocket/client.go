@@ -40,7 +40,7 @@ func New(url, apiKey, secretKey string) *Client {
 
 // Establish a WebSocket connection to Binance API
 func (client *Client) Connect(ctx context.Context) error {
-	log.Printf("Connecting to Binance's WebSocket API: %s", client.url)
+	log.Printf("Connecting to Binance WebSocket API: %s", client.url)
 
 	// Create a websocket dialer
 	dialer := websocket.Dialer{}
@@ -53,14 +53,12 @@ func (client *Client) Connect(ctx context.Context) error {
 
 	client.connection = connection
 
-	// Start a goroutine for receiving messages
 	go client.readMessages()
 
 	log.Println("Connected to Binance WebSocket API")
 	return nil
 }
 
-// Close the WebSocket connection
 func (client *Client) Close() {
 	close(client.done) // close channel
 
@@ -76,7 +74,7 @@ func (client *Client) SendRequest(method string, params any, handler ResponseHan
 		return "", fmt.Errorf("WebSocket connection is not established")
 	}
 
-	requestID := client.nextRequestID()
+	requestID := uuid.New().String()
 
 	request := models.WebSocketRequest{
 		ID:     requestID,
@@ -98,6 +96,14 @@ func (client *Client) SendRequest(method string, params any, handler ResponseHan
 
 	log.Printf("Sending request: %s", string(requestJSON))
 
+	client.mu.Lock()
+	defer client.mu.Unlock()
+
+	// Ensure connection is still valid
+	if client.connection == nil {
+		return "", fmt.Errorf("WebSocket connection is not established")
+	}
+
 	// Send the request
 	if err := client.connection.WriteMessage(websocket.TextMessage, requestJSON); err != nil {
 		return "", fmt.Errorf("failed to send request: %w", err)
@@ -112,10 +118,6 @@ func (client *Client) Ping() error {
 	})
 
 	return err
-}
-
-func (client *Client) nextRequestID() string {
-	return uuid.New().String()
 }
 
 // Read messages from the WebSocket connection

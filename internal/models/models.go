@@ -1,31 +1,29 @@
 package models
 
-import "time"
-
-// WebSocketRequest represents a WebSocket API request to Binance
+// WebSocket API request to Binance
 type WebSocketRequest struct {
-	ID     string    `json:"id"`     // Arbitrary ID used to match responses to requests
+	ID     string `json:"id"`     // Arbitrary ID used to match responses to requests
 	Method string `json:"method"` // Request method name
 	// TODO: update param object - https://developers.binance.com/docs/binance-spot-api-docs/web-socket-api/request-format
 	Params any `json:"params,omitempty"` // Request parameters. May be omitted if there are no parameters
 }
 
-// WebSocketResponse represents a WebSocket API response from Binance
+// WebSocket API response from Binance
 type WebSocketResponse struct {
-	ID         string            `json:"id"`                   // ID that matches the original request
-	Status     int            `json:"status"`               // HTTP-like status code
-	Result     OrderbookDepth `json:"result,omitempty"`     // Result data, omitted if empty
-	RateLimits []RateLimit    `json:"rateLimits,omitempty"` // Rate limiting status
-	Error      *APIError      `json:"error,omitempty"`      // Error description, omitted if empty
+	ID         string      `json:"id"`                   // ID that matches the original request
+	Status     int         `json:"status"`               // HTTP-like status code
+	Result     any         `json:"result,omitempty"`     // Result data, omitted if empty
+	RateLimits []RateLimit `json:"rateLimits,omitempty"` // Rate limiting status
+	Error      *APIError   `json:"error,omitempty"`      // Error description, omitted if empty
 }
 
-// APIError represents an error returned by the Binance API
+// Error returned from Binance
 type APIError struct {
 	Code int    `json:code`
 	Msg  string `json:msg`
 }
 
-// RateLimit represents API rate limit information
+// Rate limit information
 type RateLimit struct {
 	// TODO: update RateLimitType object - https://developers.binance.com/docs/binance-spot-api-docs/web-socket-api/rate-limits
 	RateLimitType string `json:"rateLimitType"` // Rate limit type: REQUEST_WEIGHT, ORDERS
@@ -35,17 +33,17 @@ type RateLimit struct {
 	Count         int    `json:"count"`         // Current usage per interval
 }
 
-// OrderbookDepth represents the depth of the orderbook
+// Depth of the orderbook
 type OrderbookDepth struct {
 	LastUpdateID int        `json:"lastUpdateId"` // Last update ID
 	Bids         [][]string `json:"bids"`         // Bids as [price, quantity] pairs
 	Asks         [][]string `json:"asks"`         // Asks as [price, quantity] pairs
 }
 
-// OrderStatus represents the status of an order
+// Status of an order
 type OrderStatus string
 
-// Constants for order status values
+// Order status values
 const (
 	OrderStatusNew             OrderStatus = "NEW"
 	OrderStatusPartiallyFilled OrderStatus = "PARTIALLY_FILLED"
@@ -55,7 +53,7 @@ const (
 	OrderStatusExpired         OrderStatus = "EXPIRED"
 )
 
-// Order represents a trade order
+// Trade order
 type Order struct {
 	Symbol                  string `json:"symbol"`
 	OrderID                 int64  `json:"orderId"`
@@ -74,7 +72,7 @@ type Order struct {
 	SelfTradePreventionMode string `json:"selfTradePreventionMode"`
 }
 
-// OrderParams represents parameters for placing an order
+// Parameters for placing an order
 type OrderParams struct {
 	Symbol           string `json:"symbol"`
 	Side             string `json:"side"`                  // BUY or SELL
@@ -86,7 +84,7 @@ type OrderParams struct {
 	Timestamp        int64  `json:"timestamp"` // Unix timestamp in milliseconds
 }
 
-// ParsedOrderBook represents a parsed version of the orderbook with float values
+// Parsed version of the orderbook with float values
 type ParsedOrderBook struct {
 	Symbol       string
 	LastUpdateID int
@@ -94,15 +92,8 @@ type ParsedOrderBook struct {
 	Asks         []PriceLevel
 }
 
-// PriceLevel represents a price level in the orderbook
+// Price level in the orderbook
 type PriceLevel struct {
 	Price    float64
 	Quantity float64
-}
-
-// FormatTime formats a Unix timestamp (milliseconds) as a human-readable string
-func FormatTime(timestamp int64) string {
-	// Convert milliseconds to time.Time
-	t := time.Unix(0, timestamp*int64(time.Millisecond))
-	return t.Format(time.RFC3339) // ISO 8601 format
 }
