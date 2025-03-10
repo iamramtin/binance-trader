@@ -1,189 +1,241 @@
 package main
 
 import (
+	"container/list"
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/iamramtin/binance-trader/internal/api"
-	"github.com/iamramtin/binance-trader/internal/models"
+	"github.com/iamramtin/binance-trader/internal/trader"
+	"github.com/iamramtin/binance-trader/internal/utils"
 )
 
 func main() {
 	log.Println("Starting Binance WebSocket trading application...")
 
-	symbol := "BTCUSDT"
-	limit := 5 // levels to request
-
 	url := "wss://testnet.binance.vision/ws-api/v3"
 	apiKey := os.Getenv("BINANCE_API_KEY")
 	secretKey := os.Getenv("BINANCE_SECRET_KEY")
 
-	if apiKey == "" || secretKey == "" {
-		log.Println("Warning: API key and/or secret key not provided. Order operations will not work.")
-		log.Println("Set BINANCE_API_KEY and BINANCE_SECRET_KEY environment variables.")
+	if err := utils.AuthenticateAPIKeys(apiKey, secretKey); err != nil {
+		log.Fatalf("Authentication failed: %v", err)
 	}
 
-	client := api.New(url, apiKey, secretKey, symbol)
+	// TODO: add balance check
+	symbol := "BTCTUSD"
+	limit := 5 // levels to request
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	client := api.New(url, apiKey, secretKey, symbol)
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("Failed to connect to WebSocket: %v", err)
 	}
 	defer client.Close()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// Test the signature if API keys are provided
+	log.Println("Testing API key and signature...")
+	if err := client.TestSignature(); err != nil {
+		log.Printf("Signature test failed: %v", err)
+		os.Exit(1)
+	}
+	log.Println("Signature test passed")
 
-	orderManager := client.GetOrderManager()
+	// Get the orderbook to verify connectivity
+	orderbook, err := client.GetOrderbook(limit)
+	if err != nil {
+		log.Printf("Failed to get orderbook: %v", err)
+		os.Exit(1)
+	} else {
+		client.DisplayOrderbook(orderbook, limit)
+	}
 
-	placeTestOrder(client, limit, symbol, sigCh)
+	fmt.Println("\nChoose operating mode:")
+	fmt.Println("1. Manual mode - Place individual test orders")
+	fmt.Println("2. Market maker mode - Continuously place bid/ask orders at a spread")
+	fmt.Print("Enter choice (1 or 2): ")
 
-	// Ticker for order manager status
-	statusTicker := time.NewTicker(30 * time.Second)
-	defer statusTicker.Stop()
+	var choice string
+	fmt.Scanln(&choice)
+
+	orderBookTicker := time.NewTicker(10 * time.Second)
+	manualTradeTicker := time.NewTicker(15 * time.Second)
+	manualCancelTicker := time.NewTicker(30 * time.Second)
+	marketMakerTicker := time.NewTicker(10 * time.Second)
+
+	defer func() {
+		if orderBookTicker != nil {
+			orderBookTicker.Stop()
+		}
+		if manualTradeTicker != nil {
+			manualTradeTicker.Stop()
+		}
+		if manualCancelTicker != nil {
+			manualCancelTicker.Stop()
+		}
+		if marketMakerTicker != nil {
+			marketMakerTicker.Stop()
+		}
+	}()
+
+	// Manual
+	var manualOrderQueue *list.List
+	var manualMutex sync.Mutex
+
+	// Market Maker
+	var marketMaker *trader.MarketMaker
+	marketMakerActive := false
+
+	if choice == "1" {
+		log.Println("Running in manual mode - placing test orders")
+		manualOrderQueue = list.New()
+	} else {
+		log.Println("Starting market maker strategy...")
+
+		// TODO: determine tick & quantity size - for now use 0.01 and 0.0001 for BTCTUSD
+		marketMaker = trader.New(client, symbol, 1.0, "0.0001", "0.01")
+		marketMaker.Start()
+		marketMakerActive = true
+	}
 
 	log.Printf("Application running. Trading %s. Press Ctrl+C to exit.", symbol)
 
-	// Main application loop
 	for {
 		select {
-		case <-statusTicker.C:
-			orderManager.PrintOrderSummary()
-
+		case <-orderBookTicker.C:
 			orderbook, err := client.GetOrderbook(limit)
 			if err != nil {
 				log.Printf("Failed to get orderbook: %v", err)
-			} else {
-				displayOrderbook(orderbook, limit)
-
+				continue
 			}
+
+			client.DisplayOrderbook(orderbook, limit)
+
+		case <-manualTradeTicker.C:
+			if choice != "1" {
+				continue
+			}
+
+			orderID := placeTestOrder(client, "MARKET", symbol, limit, ctx)
+			if orderID != -1 {
+				manualMutex.Lock()
+				manualOrderQueue.PushBack(orderID)
+				manualMutex.Unlock()
+			}
+
+		case <-manualCancelTicker.C:
+			if choice != "1" {
+				continue
+			}
+
+			manualMutex.Lock()
+			if manualOrderQueue.Len() > 0 {
+				oldestOrder := manualOrderQueue.Front()
+				orderID, ok := oldestOrder.Value.(int64)
+				if !ok {
+					fmt.Println("Failed to convert order ID to int64")
+					manualMutex.Unlock()
+					continue
+				}
+
+				fmt.Println("Dequeuing oldest order:", orderID)
+				go cancelTestOrder(client, orderID, ctx)
+				manualOrderQueue.Remove(oldestOrder)
+			}
+			manualMutex.Unlock()
+
+		case <-marketMakerTicker.C:
+			if choice == "1" || !marketMakerActive || marketMaker == nil {
+				continue
+			}
+
+			client.GetOrderManager().PrintOrderSummary()
 
 		case <-sigCh:
 			log.Println("Shutdown signal received, exiting...")
+
+			// Stop the market maker if active
+			if choice != "1" && marketMakerActive && marketMaker != nil {
+				log.Println("Stopping market maker strategy...")
+				marketMaker.Stop()
+			}
+
 			return
 		}
 	}
-
 }
 
-func displayOrderbook(book *models.ParsedOrderBook, limit int) {
-	log.Printf("Orderbook LastUpdateID: %d", book.LastUpdateID)
-
-	log.Println("Asks (Sell Orders):")
-	log.Println("Price\t\tQuantity")
-
-	maxAsks := min(len(book.Asks), limit)
-	for i := range maxAsks {
-		log.Printf("%.8f\t%.8f", book.Asks[i].Price, book.Asks[i].Quantity)
+func placeTestOrder(client *api.BinanceClient, orderType string, symbol string, limit int, ctx context.Context) int64 {
+	select {
+	case <-ctx.Done():
+		return -1
+	default:
 	}
 
-	log.Println()
-	log.Println("Bids (Buy Orders):")
-	log.Println("Price\t\tQuantity")
-
-	maxBids := min(len(book.Bids), limit)
-	for i := range maxBids {
-		log.Printf("%.8f\t%.8f", book.Bids[i].Price, book.Bids[i].Quantity)
-	}
-}
-
-func placeTestOrder(client *api.BinanceClient, limit int, symbol string, sigCh chan os.Signal) {
-	// TODO: subscribe to the orderbook WebSocket stream for real-time updates
-	// Consider adding something like client.SubscribeOrderbook() to keep orderbook data live
 	orderbook, err := client.GetOrderbook(limit)
-
 	if err != nil {
 		log.Printf("Failed to get orderbook: %v", err)
-	} else {
-		log.Println("Current Orderbook:")
-		displayOrderbook(orderbook, limit)
-
-		// TODO: Replace with (advanced) trading logic
-		if len(orderbook.Asks) > 0 {
-			askPrice := orderbook.Asks[0].Price
-			buyPrice := formatPrice(askPrice*0.99, "0.01") // 1% below the lowest ask
-			buyQty := "0.0001"                             // Small quantity for testing
-
-			log.Printf("Placing test LIMIT BUY order: %s %s @ %s", symbol, buyQty, buyPrice)
-
-			// TODO: Ensure qty at that price exists
-			order, err := client.PlaceOrder("BUY", "LIMIT", buyPrice, buyQty)
-			if err != nil {
-				log.Printf("Failed to place order: %v", err)
-			} else {
-				log.Printf("Order placed successfully: ID=%d, Status=%s", order.OrderID, order.Status)
-
-				go func(orderID int64) {
-					time.Sleep(1 * time.Minute)
-
-					// Check if the application is still running
-					select {
-					case <-sigCh:
-						return
-					default:
-					}
-
-					// Check if the order is still active
-					order, err := client.GetOrderStatus(orderID)
-					if err != nil {
-						log.Printf("Failed to get order status: %v", err)
-						return
-					}
-
-					if order.Status == "NEW" || order.Status == "PARTIALLY_FILLED" {
-						log.Printf("Canceling test order: %d", orderID)
-
-						// TODO: Replace with real-time listener to auto-cancel based on live events / criteria
-						canceledOrder, err := client.CancelOrder(orderID)
-						if err != nil {
-							log.Printf("Failed to cancel order: %v", err)
-							return
-						}
-
-						log.Printf("Order canceled: ID=%d, Status=%s", canceledOrder.OrderID, canceledOrder.Status)
-					} else {
-						log.Printf("Order %d is already in final state: %s", orderID, order.Status)
-					}
-				}(order.OrderID)
-			}
-		}
+		return -1
 	}
+
+	if len(orderbook.Asks) > 0 {
+		askPrice := orderbook.Asks[0].Price
+		buyPrice := utils.FormatPrice(askPrice*0.99, "0.01") // 1% below the lowest ask
+		buyQty := "0.001"                                    // Small quantity for testing
+
+		order, err := client.PlaceOrder("BUY", orderType, buyPrice, buyQty)
+		if err != nil {
+			log.Printf("Failed to place order: %v", err)
+			return -1
+		}
+
+		log.Printf("%s order placed successfully: ID=%d, Status=%s", orderType, order.OrderID, order.Status)
+
+		client.GetOrderManager().PrintOrderSummary()
+
+		return order.OrderID
+	}
+
+	return -1
 }
 
-// FormatPrice formats a price according to the tick size rules
-func formatPrice(price float64, tickSize string) string {
-	// Parse tick size
-	tickSizeFloat, err := strconv.ParseFloat(tickSize, 64)
+func cancelTestOrder(client *api.BinanceClient, orderID int64, ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		return
+	default:
+	}
+
+	// Check if the order is still active
+	order, err := client.GetOrderStatus(orderID)
 	if err != nil {
-		log.Printf("Error parsing tick size: %v", err)
-		return fmt.Sprintf("%.2f", price) // Fallback to 2 decimal places
+		log.Printf("Failed to get order status: %v", err)
+		return
 	}
 
-	// Round to the nearest tick size
-	nearestPrice := math.Round(price/tickSizeFloat) * tickSizeFloat
+	if order.Status == "NEW" || order.Status == "PARTIALLY_FILLED" {
+		log.Printf("Canceling test order: %d", orderID)
 
-	// Calculate the number of decimal places
-	decimalPlaces := 0
-	if tickSizeFloat < 1 {
-		tickStr := fmt.Sprintf("%g", tickSizeFloat)
-		parts := strings.Split(tickStr, ".")
-		if len(parts) > 1 {
-			decimalPlaces = len(parts[1])
+		canceledOrder, err := client.CancelOrder(orderID)
+		if err != nil {
+			log.Printf("Failed to cancel order: %v", err)
+			return
 		}
-	}
 
-	// Format the price with the correct number of decimal places
-	return fmt.Sprintf(fmt.Sprintf("%%.%df", decimalPlaces), nearestPrice)
+		log.Printf("Order canceled: ID=%d, Status=%s", canceledOrder.OrderID, canceledOrder.Status)
+	} else {
+		log.Printf("Order %d is already in final state: %s", orderID, order.Status)
+	}
 }
 
 // TODO: simulate checking account balance before placing the order
@@ -197,3 +249,5 @@ func formatPrice(price float64, tickSize string) string {
 // TODO: Concurrency improvements (manage multiple trades at once)
 
 // TODO: Adjust strategies to account for changes in tick size
+
+// TODO: Use GET /api/v3/exchangeInfo for the latest tick size

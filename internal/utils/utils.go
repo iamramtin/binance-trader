@@ -5,7 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"log"
+	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -48,7 +51,35 @@ func GenerateSignature(secretKey string, params map[string]string) string {
 
 func AuthenticateAPIKeys(apiKey string, secretKey string) error {
 	if apiKey == "" || secretKey == "" {
-		return fmt.Errorf("API key and Secret key are required for canceling orders")
+		log.Println("Generate Generate HMAC-SHA-256 Key: https://testnet.binance.vision")
+		log.Println("Set BINANCE_API_KEY and BINANCE_SECRET_KEY environment variables.")
+		return fmt.Errorf("API key and Secret key are required for order operations to work")
 	}
 	return nil
+}
+
+// FormatPrice formats a price according to tick size
+func FormatPrice(price float64, tickSize string) string {
+	// Parse tick size
+	tickSizeFloat, err := strconv.ParseFloat(tickSize, 64)
+	if err != nil {
+		log.Printf("Error parsing tick size: %v", err)
+		return fmt.Sprintf("%.2f", price) // Fallback to 2 decimal places
+	}
+
+	// Round to the nearest tick size
+	nearestPrice := math.Round(price/tickSizeFloat) * tickSizeFloat
+
+	// Calculate the number of decimal places
+	decimalPlaces := 0
+	if tickSizeFloat < 1 {
+		tickStr := fmt.Sprintf("%g", tickSizeFloat)
+		parts := strings.Split(tickStr, ".")
+		if len(parts) > 1 {
+			decimalPlaces = len(parts[1])
+		}
+	}
+
+	// Format the price with the correct number of decimal places
+	return fmt.Sprintf(fmt.Sprintf("%%.%df", decimalPlaces), nearestPrice)
 }

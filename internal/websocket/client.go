@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -18,6 +19,7 @@ type ResponseHandler func(response []byte)
 // WebSocket client
 type Client struct {
 	connection       *websocket.Conn
+	reconnecting     bool
 	url              string
 	apiKey           string
 	secretKey        string
@@ -39,38 +41,41 @@ func New(url, apiKey, secretKey string) *Client {
 }
 
 // Establish a WebSocket connection to Binance API
-func (client *Client) Connect(ctx context.Context) error {
-	log.Printf("Connecting to Binance WebSocket API: %s", client.url)
+func (c *Client) Connect(ctx context.Context) error {
+	log.Printf("Connecting to Binance WebSocket API: %s", c.url)
 
 	// Create a websocket dialer
 	dialer := websocket.Dialer{}
 
 	// Connect to the websocket
-	connection, _, err := dialer.DialContext(ctx, client.url, nil)
+	connection, _, err := dialer.DialContext(ctx, c.url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to connect to WebSocket: %w", err)
 	}
 
-	client.connection = connection
+	c.connection = connection
 
-	go client.readMessages()
+	go c.readMessages()
 
 	log.Println("Connected to Binance WebSocket API")
 	return nil
 }
 
-func (client *Client) Close() {
-	close(client.done) // close channel
+func (c *Client) Close() {
+	close(c.done) // close channel
 
-	if client.connection != nil {
-		client.connection.Close()
+	if c.connection != nil {
+		c.connection.Close()
 	}
 
 	log.Println("WebSocket connection closed")
 }
 
-func (client *Client) SendRequest(method string, params any, handler ResponseHandler) (string, error) {
-	if client.connection == nil {
+func (c *Client) SendRequest(method string, params any, handler ResponseHandler) (string, error) {
+	c.mu.RLock()
+
+	if c.connection == nil {
+		c.mu.RUnlock()
 		return "", fmt.Errorf("WebSocket connection is not established")
 	}
 
@@ -84,36 +89,46 @@ func (client *Client) SendRequest(method string, params any, handler ResponseHan
 
 	// Register the handler
 	if handler != nil {
-		client.mu.Lock()
-		client.responseHandlers[requestID] = handler
-		client.mu.Unlock()
+		c.mu.RUnlock()
+		c.mu.Lock()
+		c.responseHandlers[requestID] = handler
+		c.mu.Unlock()
+		c.mu.RLock()
 	}
 
 	requestJSON, err := json.Marshal(request)
 	if err != nil {
+		c.mu.RUnlock()
 		return "", fmt.Errorf("failed to marshal request: %w", err)
 	}
 
 	log.Printf("Sending request: %s", string(requestJSON))
 
-	client.mu.Lock()
-	defer client.mu.Unlock()
+	c.mu.RUnlock()
+	c.mu.Lock()
 
 	// Ensure connection is still valid
-	if client.connection == nil {
+	if c.connection == nil {
+		c.mu.Unlock()
 		return "", fmt.Errorf("WebSocket connection is not established")
 	}
 
 	// Send the request
-	if err := client.connection.WriteMessage(websocket.TextMessage, requestJSON); err != nil {
+	err = c.connection.WriteMessage(websocket.TextMessage, requestJSON)
+	c.mu.Unlock()
+
+	if err != nil {
+		// If we failed to write, attempt to reconnect
+		log.Printf("Error sending request: %v, attempting reconnect", err)
+		c.attemptReconnect()
 		return "", fmt.Errorf("failed to send request: %w", err)
 	}
 
 	return requestID, nil
 }
 
-func (client *Client) Ping() error {
-	_, err := client.SendRequest("ping", nil, func(response []byte) {
+func (c *Client) Ping() error {
+	_, err := c.SendRequest("ping", nil, func(response []byte) {
 		log.Println("Received pong response")
 	})
 
@@ -121,28 +136,29 @@ func (client *Client) Ping() error {
 }
 
 // Read messages from the WebSocket connection
-func (client *Client) readMessages() {
+func (c *Client) readMessages() {
 	for {
 		select {
-		case <-client.done:
+		case <-c.done:
 			return
 
 		default:
-			_, message, err := client.connection.ReadMessage()
+			_, message, err := c.connection.ReadMessage()
 			if err != nil {
 				log.Printf("Error reading message: %v", err)
 
 				// TODO: attempt to reconnect here
+				// c.attemptReconnect()
 				return
 			}
 
-			go client.handleMessage(message)
+			go c.handleMessage(message)
 		}
 	}
 }
 
 // Process the incoming WebSocket message
-func (client *Client) handleMessage(message []byte) {
+func (c *Client) handleMessage(message []byte) {
 	// Parse the message
 	var response models.WebSocketResponse
 	if err := json.Unmarshal(message, &response); err != nil {
@@ -158,21 +174,85 @@ func (client *Client) handleMessage(message []byte) {
 	if response.ID != "" {
 		id := fmt.Sprintf("%v", response.ID)
 
-		client.mu.RLock()
-		handler, exists := client.responseHandlers[id]
-		client.mu.RUnlock()
+		c.mu.RLock()
+		handler, exists := c.responseHandlers[id]
+		c.mu.RUnlock()
 
 		if exists {
 			handler(message)
 
 			// Remove one-time handlers
-			client.mu.Lock()
-			delete(client.responseHandlers, id)
-			client.mu.Unlock()
+			c.mu.Lock()
+			delete(c.responseHandlers, id)
+			c.mu.Unlock()
 		}
 	}
 
 	if response.Status == 200 {
 		log.Printf("Received success response for ID: %v", response.ID)
 	}
+}
+
+func (c *Client) attemptReconnect() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check if already reconnecting
+	if c.reconnecting {
+		return
+	}
+
+	c.reconnecting = true
+
+	// Close the existing connection if any
+	if c.connection != nil {
+		c.connection.Close()
+		c.connection = nil
+	}
+
+	// Start reconnection attempts in a goroutine
+	go func() {
+		attempts := 0
+		maxAttempts := 5
+		delay := 1 * time.Second
+
+		for attempts < maxAttempts {
+			log.Printf("Attempting to reconnect (attempt %d/%d)", attempts+1, maxAttempts)
+
+			// Create a new dialer
+			dialer := websocket.Dialer{
+				HandshakeTimeout: 10 * time.Second,
+			}
+
+			// Try to connect
+			conn, _, err := dialer.Dial(c.url, nil)
+			if err == nil {
+				// Successful reconnection
+				c.mu.Lock()
+				c.connection = conn
+				c.reconnecting = false
+				c.mu.Unlock()
+
+				log.Println("Successfully reconnected")
+
+				// Restart the message reader
+				go c.readMessages()
+
+				// Notify subscribers that we've reconnected
+				// Implementation depends on your design
+
+				return
+			}
+
+			log.Printf("Reconnection failed: %v", err)
+			attempts++
+			time.Sleep(delay)
+			delay *= 2 // Exponential backoff
+		}
+
+		log.Println("Failed to reconnect after maximum attempts")
+		c.mu.Lock()
+		c.reconnecting = false
+		c.mu.Unlock()
+	}()
 }

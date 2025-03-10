@@ -32,9 +32,9 @@ func New() *Manager {
 }
 
 // Add a new order to be tracked
-func (manager *Manager) TrackOrder(order *models.Order) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
+func (m *Manager) TrackOrder(order *models.Order) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
 	// Create the order state
 	state := &OrderState{
@@ -44,24 +44,24 @@ func (manager *Manager) TrackOrder(order *models.Order) {
 	}
 
 	// Store by order ID
-	manager.orders[order.OrderID] = state
+	m.orders[order.OrderID] = state
 
 	// Also store by client order ID if available
 	if order.ClientOrderID != "" {
-		manager.clientOrders[order.ClientOrderID] = state
+		m.clientOrders[order.ClientOrderID] = state
 	}
 
 	log.Printf("Tracking new order: %d (%s)", order.OrderID, order.ClientOrderID)
 }
 
 // Update an existing order
-func (manager *Manager) UpdateOrder(order *models.Order) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
+func (m *Manager) UpdateOrder(order *models.Order) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	state, exists := manager.orders[order.OrderID]
+	state, exists := m.orders[order.OrderID]
 	if !exists {
-		state, exists = manager.clientOrders[order.ClientOrderID]
+		state, exists = m.clientOrders[order.ClientOrderID]
 		if !exists {
 			return fmt.Errorf("order not found: %d (%s)", order.OrderID, order.ClientOrderID)
 		}
@@ -76,11 +76,11 @@ func (manager *Manager) UpdateOrder(order *models.Order) error {
 }
 
 // Retrieve an order
-func (manager *Manager) GetOrder(orderID int64) (*models.Order, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
+func (m *Manager) GetOrder(orderID int64) (*models.Order, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	state, exists := manager.orders[orderID]
+	state, exists := m.orders[orderID]
 	if !exists {
 		if !exists {
 			return nil, fmt.Errorf("order not found: %d", orderID)
@@ -91,11 +91,11 @@ func (manager *Manager) GetOrder(orderID int64) (*models.Order, error) {
 }
 
 // Retrieve an order by client ID
-func (manager *Manager) GetClientOrders(clientOrderID string) (*models.Order, error) {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
+func (m *Manager) GetClientOrders(clientOrderID string) (*models.Order, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	state, exists := manager.clientOrders[clientOrderID]
+	state, exists := m.clientOrders[clientOrderID]
 	if !exists {
 		if !exists {
 			return nil, fmt.Errorf("order not found: %s", clientOrderID)
@@ -106,12 +106,12 @@ func (manager *Manager) GetClientOrders(clientOrderID string) (*models.Order, er
 }
 
 // Retrieve all orders
-func (manager *Manager) GetAllOrders() []models.Order {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
+func (m *Manager) GetAllOrders() []models.Order {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	orders := make([]models.Order, 0, len(manager.orders))
-	for _, state := range manager.orders {
+	orders := make([]models.Order, 0, len(m.orders))
+	for _, state := range m.orders {
 		orders = append(orders, state.Order)
 	}
 
@@ -119,12 +119,12 @@ func (manager *Manager) GetAllOrders() []models.Order {
 }
 
 // Return all orders with the specified status
-func (manager *Manager) GetOrdersByStatus(status models.OrderStatus) []models.Order {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
+func (m *Manager) GetOrdersByStatus(status models.OrderStatus) []models.Order {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	orders := make([]models.Order, 0, len(manager.orders))
-	for _, state := range manager.orders {
+	orders := make([]models.Order, 0, len(m.orders))
+	for _, state := range m.orders {
 		if models.OrderStatus(state.Order.Status) == status {
 			orders = append(orders, state.Order)
 		}
@@ -134,17 +134,17 @@ func (manager *Manager) GetOrdersByStatus(status models.OrderStatus) []models.Or
 }
 
 // Return all orders with any of the specified statuses
-func (manager *Manager) GetOrdersByStatuses(statuses []models.OrderStatus) []models.Order {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
+func (m *Manager) GetOrdersByStatuses(statuses []models.OrderStatus) []models.Order {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	statusSet := make(map[models.OrderStatus]struct{}, len(statuses))
 	for _, status := range statuses {
 		statusSet[status] = struct{}{}
 	}
 
-	orders := make([]models.Order, 0, len(manager.orders))
-	for _, state := range manager.orders {
+	orders := make([]models.Order, 0, len(m.orders))
+	for _, state := range m.orders {
 		if _, exists := statusSet[models.OrderStatus(state.Order.Status)]; exists {
 			orders = append(orders, state.Order)
 		}
@@ -154,36 +154,36 @@ func (manager *Manager) GetOrdersByStatuses(statuses []models.OrderStatus) []mod
 }
 
 // Return all active orders (not filled, canceled, or rejected)
-func (manager *Manager) GetActiveOrders() []models.Order {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
+func (m *Manager) GetActiveOrders() []models.Order {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
-	return manager.GetOrdersByStatuses([]models.OrderStatus{models.OrderStatusNew, models.OrderStatusPartiallyFilled})
+	return m.GetOrdersByStatuses([]models.OrderStatus{models.OrderStatusNew, models.OrderStatusPartiallyFilled})
 }
 
 // Return all executed (filled) orders
-func (manager *Manager) GetExecutedOrders() []models.Order {
-	return manager.GetOrdersByStatus(models.OrderStatusFilled)
+func (m *Manager) GetExecutedOrders() []models.Order {
+	return m.GetOrdersByStatus(models.OrderStatusFilled)
 }
 
 // Return all canceled orders
-func (manager *Manager) GetCanceledOrders() []models.Order {
-	return manager.GetOrdersByStatus(models.OrderStatusCanceled)
+func (m *Manager) GetCanceledOrders() []models.Order {
+	return m.GetOrdersByStatus(models.OrderStatusCanceled)
 }
 
 // Remove an order from tracking
-func (manager *Manager) RemoveOrder(orderID int64) error {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
+func (m *Manager) RemoveOrder(orderID int64) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	order, err := manager.GetOrder(orderID)
+	order, err := m.GetOrder(orderID)
 	if err != nil {
 		return err
 	}
 
-	delete(manager.orders, orderID)
+	delete(m.orders, orderID)
 	if order.ClientOrderID != "" {
-		delete(manager.clientOrders, order.ClientOrderID)
+		delete(m.clientOrders, order.ClientOrderID)
 	}
 
 	log.Printf("Removed order from tracking: %d", orderID)
@@ -191,16 +191,24 @@ func (manager *Manager) RemoveOrder(orderID int64) error {
 }
 
 // Print a summary of the current orders
-func (manager *Manager) PrintOrderSummary() {
-	manager.mu.RLock()
-	defer manager.mu.RUnlock()
+func (m *Manager) PrintOrderSummary() {
+	if m == nil {
+		log.Println("Warning: Order manager is nil")
+		return
+	}
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 
 	log.Println("===== ORDER SUMMARY =====")
-	log.Printf("Total Orders: %d", len(manager.orders))
+	log.Printf("Total Orders: %d", len(m.orders))
 
 	// Count by status
 	statusCounts := make(map[string]int)
-	for _, state := range manager.orders {
+	for _, state := range m.orders {
+		if state == nil {
+			continue
+		}
 		statusCounts[state.Order.Status]++
 	}
 
@@ -209,4 +217,15 @@ func (manager *Manager) PrintOrderSummary() {
 	}
 
 	log.Println("=========================")
+
+	filledOrders := m.GetOrdersByStatus("FILLED")
+	if len(filledOrders) > 0 {
+		log.Printf("Found %d filled orders", len(filledOrders))
+
+		// For now, just log them
+		for _, order := range filledOrders {
+			log.Printf("Filled order: %d, Side: %s, Qty: %s, Price: %s",
+				order.OrderID, order.Side, order.ExecutedQty, order.Price)
+		}
+	}
 }
