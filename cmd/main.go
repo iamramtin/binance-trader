@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -16,20 +18,52 @@ import (
 	"github.com/iamramtin/binance-trader/internal/utils"
 )
 
+type Timers struct {
+	OrderBook    *time.Ticker
+	ManualTrade  *time.Ticker
+	ManualCancel *time.Ticker
+	OrderSummary *time.Ticker
+}
+
+type Config struct {
+	Symbol           string
+	Quantity         float64
+	SpreadPercentage float64
+	Price            string
+	TickSize         string
+	OrderbookDepth   int
+	WebSocketURL     string
+	APIKey           string
+	SecretKey        string
+}
+
+type TradingComponents struct {
+	ManualOrderQueue  *list.List
+	ManualMutex       sync.Mutex
+	MarketMaker       *trader.MarketMaker
+	MarketMakerActive bool
+}
+
 func main() {
 	log.Println("Starting Binance WebSocket trading application...")
 
-	url := "wss://testnet.binance.vision/ws-api/v3"
-	apiKey := os.Getenv("BINANCE_API_KEY")
-	secretKey := os.Getenv("BINANCE_SECRET_KEY")
-
-	if err := utils.AuthenticateAPIKeys(apiKey, secretKey); err != nil {
-		log.Fatalf("Authentication failed: %v", err)
+	config := &Config{
+		WebSocketURL:     "wss://testnet.binance.vision/ws-api/v3",
+		APIKey:           os.Getenv("BINANCE_API_KEY"),
+		SecretKey:        os.Getenv("BINANCE_SECRET_KEY"),
+		Symbol:           "BTCTUSD",
+		Quantity:         0.001,
+		SpreadPercentage: 0.0001,
+		OrderbookDepth:   5,
+		Price:            "0.01",
+		TickSize:         "0.01",
 	}
 
-	// TODO: add balance check
-	symbol := "BTCTUSD"
-	limit := 5 // levels to request
+	choice := getUserPrompt(config)
+
+	if err := validateConfig(config); err != nil {
+		log.Fatalf("Configuration error: %v", err)
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -37,137 +71,60 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	client := api.New(url, apiKey, secretKey, symbol)
+	client := api.New(config.WebSocketURL, config.APIKey, config.SecretKey, config.Symbol)
 	if err := client.Connect(ctx); err != nil {
 		log.Fatalf("Failed to connect to WebSocket: %v", err)
 	}
 	defer client.Close()
 
 	// Test the signature if API keys are provided
-	log.Println("Testing API key and signature...")
-	if err := client.TestSignature(); err != nil {
-		log.Printf("Signature test failed: %v", err)
+	if err := testAuthentication(client, config); err != nil {
+		log.Fatalf("Authentication failed: %v", err)
 		os.Exit(1)
 	}
-	log.Println("Signature test passed")
 
-	// Get the orderbook to verify connectivity
-	orderbook, err := client.GetOrderbook(limit)
-	if err != nil {
-		log.Printf("Failed to get orderbook: %v", err)
-		os.Exit(1)
-	} else {
-		client.DisplayOrderbook(orderbook, limit)
-	}
+	printAccountBalance(client)
 
-	fmt.Println("\nChoose operating mode:")
-	fmt.Println("1. Manual mode - Place individual test orders")
-	fmt.Println("2. Market maker mode - Continuously place bid/ask orders at a spread")
-	fmt.Print("Enter choice (1 or 2): ")
+	timers := setupTimers()
+	defer stopTimers(timers)
 
-	var choice string
-	fmt.Scanln(&choice)
+	components := initTradingComponents(choice, client, config)
 
-	orderBookTicker := time.NewTicker(10 * time.Second)
-	manualTradeTicker := time.NewTicker(15 * time.Second)
-	manualCancelTicker := time.NewTicker(30 * time.Second)
-	marketMakerTicker := time.NewTicker(10 * time.Second)
-
-	defer func() {
-		if orderBookTicker != nil {
-			orderBookTicker.Stop()
-		}
-		if manualTradeTicker != nil {
-			manualTradeTicker.Stop()
-		}
-		if manualCancelTicker != nil {
-			manualCancelTicker.Stop()
-		}
-		if marketMakerTicker != nil {
-			marketMakerTicker.Stop()
-		}
-	}()
-
-	// Manual
-	var manualOrderQueue *list.List
-	var manualMutex sync.Mutex
-
-	// Market Maker
-	var marketMaker *trader.MarketMaker
-	marketMakerActive := false
-
-	if choice == "1" {
-		log.Println("Running in manual mode - placing test orders")
-		manualOrderQueue = list.New()
-	} else {
-		log.Println("Starting market maker strategy...")
-
-		// TODO: determine tick & quantity size - for now use 0.01 and 0.0001 for BTCTUSD
-		marketMaker = trader.New(client, symbol, 1.0, "0.0001", "0.01")
-		marketMaker.Start()
-		marketMakerActive = true
-	}
-
-	log.Printf("Application running. Trading %s. Press Ctrl+C to exit.", symbol)
+	log.Printf("Application running. Trading %s. Press Ctrl+C to exit.", config.Symbol)
 
 	for {
 		select {
-		case <-orderBookTicker.C:
-			orderbook, err := client.GetOrderbook(limit)
-			if err != nil {
-				log.Printf("Failed to get orderbook: %v", err)
-				continue
-			}
+		case <-timers.OrderBook.C:
+			printOrderBook(client, config.OrderbookDepth)
 
-			client.DisplayOrderbook(orderbook, limit)
-
-		case <-manualTradeTicker.C:
-			if choice != "1" {
-				continue
-			}
-
-			orderID := placeTestOrder(client, "MARKET", symbol, limit, ctx)
-			if orderID != -1 {
-				manualMutex.Lock()
-				manualOrderQueue.PushBack(orderID)
-				manualMutex.Unlock()
-			}
-
-		case <-manualCancelTicker.C:
-			if choice != "1" {
-				continue
-			}
-
-			manualMutex.Lock()
-			if manualOrderQueue.Len() > 0 {
-				oldestOrder := manualOrderQueue.Front()
-				orderID, ok := oldestOrder.Value.(int64)
-				if !ok {
-					fmt.Println("Failed to convert order ID to int64")
-					manualMutex.Unlock()
-					continue
-				}
-
-				fmt.Println("Dequeuing oldest order:", orderID)
-				go cancelTestOrder(client, orderID, ctx)
-				manualOrderQueue.Remove(oldestOrder)
-			}
-			manualMutex.Unlock()
-
-		case <-marketMakerTicker.C:
-			if choice == "1" || !marketMakerActive || marketMaker == nil {
-				continue
-			}
-
+		case <-timers.OrderSummary.C:
 			client.GetOrderManager().PrintOrderSummary()
+
+		case <-timers.ManualTrade.C:
+			if choice != "1" {
+				continue
+			}
+
+			orderID := placeTestOrder(client, "MARKET", config.Symbol, fmt.Sprintf("%f", config.Quantity), config.OrderbookDepth, ctx)
+			if orderID != -1 {
+				components.ManualMutex.Lock()
+				components.ManualOrderQueue.PushBack(orderID)
+				components.ManualMutex.Unlock()
+			}
+
+		case <-timers.ManualCancel.C:
+			if choice != "1" {
+				continue
+			}
+
+			handleManualOrderCancellation(components, client, ctx)
 
 		case <-sigCh:
 			log.Println("Shutdown signal received, exiting...")
 
-			// Stop the market maker if active
-			if choice != "1" && marketMakerActive && marketMaker != nil {
+			if choice != "1" && components.MarketMakerActive && components.MarketMaker != nil {
 				log.Println("Stopping market maker strategy...")
-				marketMaker.Stop()
+				components.MarketMaker.Stop()
 			}
 
 			return
@@ -175,7 +132,211 @@ func main() {
 	}
 }
 
-func placeTestOrder(client *api.BinanceClient, orderType string, symbol string, limit int, ctx context.Context) int64 {
+func promptForConfig(config *Config) *Config {
+	fmt.Println("\nEnter trading parameters (press Enter to use defaults):")
+
+	fmt.Printf("Symbol [%s]: ", config.Symbol)
+	var input string
+	fmt.Scanln(&input)
+	if strings.TrimSpace(input) != "" {
+		config.Symbol = strings.ToUpper(strings.TrimSpace(input))
+	}
+
+	fmt.Printf("Quantity [%f]: ", config.Quantity)
+	fmt.Scanln(&input)
+	if strings.TrimSpace(input) != "" {
+		if val, err := strconv.ParseFloat(input, 64); err == nil && val > 0 {
+			config.Quantity = val
+		} else {
+			log.Printf("Invalid quantity, using default: %f", config.Quantity)
+		}
+	}
+
+	fmt.Printf("Spread Percentage [%f]: ", config.SpreadPercentage)
+	fmt.Scanln(&input)
+	fmt.Println()
+	if strings.TrimSpace(input) != "" {
+		if val, err := strconv.ParseFloat(input, 64); err == nil && val > 0 {
+			config.SpreadPercentage = val
+		} else {
+			log.Printf("Invalid spread, using default: %f", config.SpreadPercentage)
+		}
+	}
+
+	return config
+}
+
+func validateConfig(config *Config) error {
+	if config.Symbol == "" {
+		return fmt.Errorf("trading symbol cannot be empty")
+	}
+
+	if config.Quantity <= 0 {
+		return fmt.Errorf("quantity must be greater than 0")
+	}
+
+	if config.SpreadPercentage <= 0 {
+		return fmt.Errorf("spread percentage must be greater than 0")
+	}
+
+	return utils.AuthenticateAPIKeys(config.APIKey, config.SecretKey)
+}
+
+func testAuthentication(client *api.BinanceClient, config *Config) error {
+	log.Println("Testing API key and signature...")
+	if err := client.TestSignature(); err != nil {
+		return err
+	}
+
+	log.Println("Signature test passed")
+
+	// Get the orderbook to verify connectivity
+	orderbook, err := client.GetOrderbook(config.OrderbookDepth)
+	if err != nil {
+		return fmt.Errorf("failed to get orderbook: %v", err)
+	}
+
+	client.DisplayOrderbook(orderbook, config.OrderbookDepth)
+	return nil
+}
+
+func getUserPrompt(config *Config) string {
+	fmt.Println("\nEnter trading parameters (press Enter to use default values):")
+
+	// Symbol
+	fmt.Printf("Symbol [%s]: ", config.Symbol)
+	var input string
+	fmt.Scanln(&input)
+	if strings.TrimSpace(input) != "" {
+		config.Symbol = strings.ToUpper(strings.TrimSpace(input))
+	}
+
+	// Quantity
+	fmt.Printf("Quantity [%f]: ", config.Quantity)
+	fmt.Scanln(&input)
+	if strings.TrimSpace(input) != "" {
+		if val, err := strconv.ParseFloat(input, 64); err == nil && val > 0 {
+			config.Quantity = val
+		} else {
+			fmt.Printf("Invalid quantity '%s', using default: %f\n", input, config.Quantity)
+		}
+	}
+
+	fmt.Println("\nChoose operating mode:")
+	fmt.Println("1. Manual mode - Place individual test market orders")
+	fmt.Println("2. Basic market maker - Continuously place bid/ask orders at a fixed spread")
+	fmt.Print("Enter choice (1 or 2): ")
+
+	var choice string
+	fmt.Scanln(&choice)
+	fmt.Println()
+
+	if choice == "2" || choice == "3" {
+		fmt.Printf("Spread Percentage [%f]: ", config.SpreadPercentage)
+		var input string
+		fmt.Scanln(&input)
+		if strings.TrimSpace(input) != "" {
+			if val, err := strconv.ParseFloat(input, 64); err == nil && val > 0 {
+				config.SpreadPercentage = val
+			} else {
+				fmt.Printf("Invalid spread percentage '%s', using default: %f\n", input, config.SpreadPercentage)
+			}
+		}
+	}
+
+	return choice
+}
+
+func setupTimers() *Timers {
+	return &Timers{
+		OrderBook:    time.NewTicker(10 * time.Second),
+		OrderSummary: time.NewTicker(10 * time.Second),
+		ManualTrade:  time.NewTicker(15 * time.Second),
+		ManualCancel: time.NewTicker(30 * time.Second),
+	}
+}
+
+func stopTimers(timers *Timers) {
+	if timers.OrderBook != nil {
+		timers.OrderBook.Stop()
+	}
+	if timers.ManualTrade != nil {
+		timers.ManualTrade.Stop()
+	}
+	if timers.ManualCancel != nil {
+		timers.ManualCancel.Stop()
+	}
+	if timers.OrderSummary != nil {
+		timers.OrderSummary.Stop()
+	}
+}
+
+func initTradingComponents(choice string, client *api.BinanceClient, config *Config) *TradingComponents {
+	components := &TradingComponents{
+		MarketMakerActive: false,
+	}
+
+	if choice == "2" {
+		log.Println("\nStarting basic market maker strategy...")
+		log.Printf("Using spread percentage: %f, quantity: %f", config.SpreadPercentage, config.Quantity)
+
+		components.MarketMaker = trader.New(
+			client,
+			config.Symbol,
+			config.SpreadPercentage,
+			fmt.Sprintf("%f", config.Quantity),
+			config.TickSize,
+		)
+
+		components.MarketMaker.Start()
+		components.MarketMakerActive = true
+	} else {
+		log.Println("\nRunning in manual mode - placing test orders")
+		components.ManualOrderQueue = list.New()
+	}
+
+	return components
+}
+
+func printAccountBalance(client *api.BinanceClient) {
+	balance, err := client.GetAccountBalance()
+	if err != nil {
+		log.Printf("Failed to get account balance: %v", err)
+		return
+	}
+
+	client.DisplayAccountBalance(balance)
+}
+
+func printOrderBook(client *api.BinanceClient, depth int) {
+	orderbook, err := client.GetOrderbook(depth)
+	if err != nil {
+		log.Printf("Failed to get orderbook: %v", err)
+		return
+	}
+
+	client.DisplayOrderbook(orderbook, depth)
+}
+
+func handleManualOrderCancellation(components *TradingComponents, client *api.BinanceClient, ctx context.Context) {
+	components.ManualMutex.Lock()
+	defer components.ManualMutex.Unlock()
+
+	if components.ManualOrderQueue.Len() > 0 {
+		oldestOrder := components.ManualOrderQueue.Front()
+		orderID, ok := oldestOrder.Value.(int64)
+		if !ok {
+			fmt.Println("Failed to convert order ID to int64")
+			return
+		}
+
+		fmt.Println("Dequeuing oldest order:", orderID)
+		go cancelTestOrder(client, orderID, ctx)
+		components.ManualOrderQueue.Remove(oldestOrder)
+	}
+}
+
+func placeTestOrder(client *api.BinanceClient, orderType string, symbol string, quantity string, limit int, ctx context.Context) int64 {
 	select {
 	case <-ctx.Done():
 		return -1
@@ -191,9 +352,8 @@ func placeTestOrder(client *api.BinanceClient, orderType string, symbol string, 
 	if len(orderbook.Asks) > 0 {
 		askPrice := orderbook.Asks[0].Price
 		buyPrice := utils.FormatPrice(askPrice*0.99, "0.01") // 1% below the lowest ask
-		buyQty := "0.001"                                    // Small quantity for testing
 
-		order, err := client.PlaceOrder("BUY", orderType, buyPrice, buyQty)
+		order, err := client.PlaceOrder("BUY", orderType, buyPrice, quantity)
 		if err != nil {
 			log.Printf("Failed to place order: %v", err)
 			return -1
@@ -237,17 +397,3 @@ func cancelTestOrder(client *api.BinanceClient, orderID int64, ctx context.Conte
 		log.Printf("Order %d is already in final state: %s", orderID, order.Status)
 	}
 }
-
-// TODO: simulate checking account balance before placing the order
-
-// TODO: Handle WebSocket Reconnection
-// If Binance disconnects the WebSocket, your bot should reconnect automatically
-
-// TODO: Improve Error Handling
-// If Binance API fails, nothing happens. Add retry logic for failures.
-
-// TODO: Concurrency improvements (manage multiple trades at once)
-
-// TODO: Adjust strategies to account for changes in tick size
-
-// TODO: Use GET /api/v3/exchangeInfo for the latest tick size

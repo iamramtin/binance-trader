@@ -147,8 +147,7 @@ func (c *Client) readMessages() {
 			if err != nil {
 				log.Printf("Error reading message: %v", err)
 
-				// TODO: attempt to reconnect here
-				// c.attemptReconnect()
+				c.attemptReconnect()
 				return
 			}
 

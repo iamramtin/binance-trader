@@ -172,7 +172,6 @@ func (m *MarketMaker) refreshOrders(askPrice string, bidPrice string) error {
 		_, err := m.client.CancelOrder(orderID)
 		if err != nil {
 			log.Printf("Failed to cancel order %d: %v", orderID, err)
-			// TODO: Continue with other orders even if one fails
 		}
 
 		m.mu.Lock()
